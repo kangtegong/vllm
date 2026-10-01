@@ -582,6 +582,27 @@ class Scheduler(SchedulerInterface):
                 req_index += 1
                 continue
 
+            # Cake-style bidirectional KV restore (KV-connector extension): while
+            # this prefill computes from the front, a background loader fills the
+            # cached tail of the prompt from storage back-to-front. Once the
+            # compute frontier reaches the loaded region, skip it to the end of
+            # the cached tail (the KV there is already in the paged cache).
+            kv_tail_end = getattr(request, "kv_tail_end", 0)
+            if kv_tail_end:
+                if kv_tail_end <= request.num_computed_tokens:
+                    request.kv_tail_end = 0
+                elif self.connector is not None and request.num_preemptions == 0:
+                    probe = getattr(self.connector, "cake_tail_front", None)
+                    loaded_from = (
+                        probe(request.request_id) if probe is not None else None
+                    )
+                    if (
+                        loaded_from is not None
+                        and request.num_computed_tokens >= loaded_from
+                    ):
+                        request.num_computed_tokens = kv_tail_end
+                        request.kv_tail_end = 0
+
             num_new_tokens = (
                 request.num_tokens_with_spec
                 + request.num_output_placeholders
@@ -1064,6 +1085,16 @@ class Scheduler(SchedulerInterface):
                     num_encoder_tokens = sum(
                         request.get_num_encoder_embeds(i)
                         for i in encoder_inputs_to_schedule
+                    )
+
+                # Cake-style tail restore: the background loader writes the cached
+                # tail straight into this request's paged blocks, so allocate the
+                # blocks for the whole tail region up front (as lookahead).
+                kv_tail_end = getattr(request, "kv_tail_end", 0)
+                if kv_tail_end:
+                    effective_lookahead_tokens = max(
+                        effective_lookahead_tokens,
+                        kv_tail_end - num_computed_tokens - num_new_tokens,
                     )
 
                 reserved_blocks = 0
