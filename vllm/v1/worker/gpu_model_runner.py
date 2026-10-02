@@ -1365,12 +1365,6 @@ class GPUModelRunner(
         for i, req_id in enumerate(req_data.req_ids):
             req_state = self.requests[req_id]
             num_computed_tokens = req_data.num_computed_tokens[i]
-            if num_computed_tokens - req_state.num_computed_tokens > 2048:
-                logger.info(
-                    "CAKE RUNNER req=%s recv_computed=%d state_computed=%d "
-                    "num_tokens=%d outputs=%d",
-                    req_id, num_computed_tokens, req_state.num_computed_tokens,
-                    req_state.num_tokens, len(req_state.output_token_ids))
             new_block_ids = req_data.new_block_ids[i]
             resumed_from_preemption = req_id in req_data.resumed_req_ids
             num_output_tokens = req_data.num_output_tokens[i]
@@ -2124,14 +2118,6 @@ class GPUModelRunner(
         self.discard_request_mask.np[:num_reqs] = (
             self.optimistic_seq_lens_cpu[:num_reqs].numpy() < num_tokens_np
         )
-        for _ri in np.nonzero(num_scheduled_tokens > 1)[0]:
-            logger.info(
-                "CAKE DISCARD? req=%s computed=%d sched=%d num_tokens=%d discard=%d",
-                self.input_batch.req_ids[_ri],
-                int(self.input_batch.num_computed_tokens_cpu[_ri]),
-                int(num_scheduled_tokens[_ri]),
-                int(num_tokens_np[_ri]),
-                int(self.discard_request_mask.np[_ri]))
         self.discard_request_mask.copy_to_gpu(num_reqs)
 
         # Sync num_accepted_tokens from CPU (set by

@@ -1071,26 +1071,26 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         # Add new blocks and update num_computed_tokens for the existing requests.
         reqs = scheduler_output.scheduled_cached_reqs
         num_computed_tokens_np = self.req_states.num_computed_tokens_np
-        # Cake-style KV restore (fork): the scheduler may advance a request's
+        # Partial-recomputation KV restore (fork): the scheduler may advance a request's
         # num_computed_tokens past tokens it never scheduled, because their KV
         # was loaded into the paged cache by the connector. The GPU-side
         # num_computed_tokens tensor normally advances only by executed tokens
         # (post_update_num_computed_tokens), so such a jump must be written to
         # the GPU tensor explicitly; it feeds positions, seq_len, and the
         # prompt-completion check of the input-prep kernels.
-        from vllm.v1.core.sched.scheduler import CAKE_JUMPS
+        from vllm.v1.core.sched.scheduler import PR_JUMPS
         jump_applied = False
         for req_id, num_computed_tokens, req_new_block_ids in zip(
             reqs.req_ids, reqs.num_computed_tokens, reqs.new_block_ids
         ):
             req_index = self.req_states.req_id_to_index[req_id]
-            if CAKE_JUMPS and CAKE_JUMPS.pop(req_id, None) is not None:
+            if PR_JUMPS and PR_JUMPS.pop(req_id, None) is not None:
                 self.req_states.num_computed_tokens.stage_write_elem(
                     req_index, num_computed_tokens
                 )
                 jump_applied = True
                 logger.info(
-                    "CAKE V2JUMP req=%s gpu num_computed_tokens <- %d",
+                    "PR V2JUMP req=%s gpu num_computed_tokens <- %d",
                     req_id, num_computed_tokens)
             num_computed_tokens_np[req_index] = num_computed_tokens
             if req_new_block_ids is not None:

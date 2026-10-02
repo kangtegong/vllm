@@ -70,12 +70,12 @@ from vllm.v1.utils import record_function_or_nullcontext
 
 logger = init_logger(__name__)
 
-# Cake-style KV restore (fork): req_id -> num_computed_tokens target of a
+# Partial-recomputation KV restore (fork): req_id -> num_computed_tokens target of a
 # jump performed in the running loop. The V2 model runner (same process,
 # uniproc executor) pops entries in update_requests and writes the jumped
 # value into its GPU-side num_computed_tokens tensor, which otherwise only
 # advances by executed tokens.
-CAKE_JUMPS: dict[str, int] = {}
+PR_JUMPS: dict[str, int] = {}
 
 
 class Scheduler(SchedulerInterface):
@@ -589,13 +589,13 @@ class Scheduler(SchedulerInterface):
                 req_index += 1
                 continue
 
-            # Cake-style bidirectional KV restore (KV-connector extension): while
+            # Partial-recomputation bidirectional KV restore (KV-connector extension): while
             # this prefill computes from the front, a background loader fills the
             # cached tail of the prompt from storage back-to-front. Once the
             # compute frontier reaches the loaded region, skip it to the end of
             # the cached tail (the KV there is already in the paged cache).
             kv_tail_end = getattr(request, "kv_tail_end", 0)
-            cake_drain = False
+            pr_drain = False
             if kv_tail_end:
                 if kv_tail_end <= request.num_computed_tokens:
                     request.kv_tail_end = 0
@@ -609,7 +609,7 @@ class Scheduler(SchedulerInterface):
                     and request.num_output_placeholders == 0
                     and kv_tail_end < request.num_prompt_tokens
                 ):
-                    probe = getattr(self.connector, "cake_tail_front", None)
+                    probe = getattr(self.connector, "pr_tail_front", None)
                     loaded_from = (
                         probe(request.request_id) if probe is not None else None
                     )
@@ -621,27 +621,21 @@ class Scheduler(SchedulerInterface):
                             # Scheduled-but-unexecuted tokens exist (batch-queue
                             # pipelining): schedule nothing for this request this
                             # step so they drain, then advance on a later step.
-                            cake_drain = True
+                            pr_drain = True
                         else:
                             logger.info(
-                                "CAKE JUMP req=%s computed %d -> %d (tail_front=%d)",
+                                "PR JUMP req=%s computed %d -> %d (tail_front=%d)",
                                 request.request_id, request.num_computed_tokens,
                                 kv_tail_end, loaded_from)
                             request.num_computed_tokens = kv_tail_end
                             request.kv_tail_end = 0
-                            CAKE_JUMPS[request.request_id] = kv_tail_end
+                            PR_JUMPS[request.request_id] = kv_tail_end
 
             num_new_tokens = (
                 request.num_tokens_with_spec
                 + request.num_output_placeholders
                 - request.num_computed_tokens
             )
-            if getattr(request, "_cake_dbg", False) or kv_tail_end:
-                request._cake_dbg = True
-                logger.info(
-                    "CAKE SCHED req=%s computed=%d new=%d tail_end=%d",
-                    request.request_id, request.num_computed_tokens,
-                    num_new_tokens, kv_tail_end)
             if 0 < self.scheduler_config.long_prefill_token_threshold < num_new_tokens:
                 num_new_tokens = self.scheduler_config.long_prefill_token_threshold
             num_new_tokens = min(
@@ -657,8 +651,8 @@ class Scheduler(SchedulerInterface):
                 - self.num_sampled_tokens_per_step,
             )
 
-            if cake_drain:
-                # Hold this request for one step (see the cake block above);
+            if pr_drain:
+                # Hold this request for one step (see the partial-recomp block above);
                 # the num_new_tokens == 0 path below handles it.
                 num_new_tokens = 0
 
@@ -1126,7 +1120,7 @@ class Scheduler(SchedulerInterface):
                         for i in encoder_inputs_to_schedule
                     )
 
-                # Cake-style tail restore: the background loader writes the cached
+                # Partial-recomputation-style tail restore: the background loader writes the cached
                 # tail straight into this request's paged blocks, so allocate the
                 # blocks for the whole tail region up front (as lookahead).
                 kv_tail_end = getattr(request, "kv_tail_end", 0)
@@ -1965,13 +1959,6 @@ class Scheduler(SchedulerInterface):
             generated_token_ids = (
                 sampled_token_ids[req_index] if sampled_token_ids else []
             )
-            if getattr(request, "_cake_dbg", False):
-                logger.info(
-                    "CAKE OUT req=%s sched=%d generated=%d computed=%d "
-                    "num_tokens=%d stale=%s",
-                    req_id, num_tokens_scheduled, len(generated_token_ids),
-                    request.num_computed_tokens, request.num_tokens,
-                    output_is_stale)
 
             scheduled_spec_token_ids = (
                 scheduler_output.scheduled_spec_decode_tokens.get(req_id)
