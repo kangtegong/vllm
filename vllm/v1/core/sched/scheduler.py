@@ -70,13 +70,6 @@ from vllm.v1.utils import record_function_or_nullcontext
 
 logger = init_logger(__name__)
 
-# Partial-recomputation KV restore (fork): req_id -> num_computed_tokens target of a
-# jump performed in the running loop. The V2 model runner (same process,
-# uniproc executor) pops entries in update_requests and writes the jumped
-# value into its GPU-side num_computed_tokens tensor, which otherwise only
-# advances by executed tokens.
-PR_JUMPS: dict[str, int] = {}
-
 
 class Scheduler(SchedulerInterface):
     def __init__(
@@ -589,48 +582,6 @@ class Scheduler(SchedulerInterface):
                 req_index += 1
                 continue
 
-            # Partial-recomputation bidirectional KV restore (KV-connector extension): while
-            # this prefill computes from the front, a background loader fills the
-            # cached tail of the prompt from storage back-to-front. Once the
-            # compute frontier reaches the loaded region, skip it to the end of
-            # the cached tail (the KV there is already in the paged cache).
-            kv_tail_end = getattr(request, "kv_tail_end", 0)
-            pr_drain = False
-            if kv_tail_end:
-                if kv_tail_end <= request.num_computed_tokens:
-                    request.kv_tail_end = 0
-                elif (
-                    self.connector is not None
-                    and request.num_preemptions == 0
-                    # Rewriting num_computed_tokens is only safe while the
-                    # request is strictly prefilling: doing it during decode /
-                    # spec-decode bookkeeping made requests run past max_tokens.
-                    and request.num_output_tokens == 0
-                    and request.num_output_placeholders == 0
-                    and kv_tail_end < request.num_prompt_tokens
-                ):
-                    probe = getattr(self.connector, "pr_tail_front", None)
-                    loaded_from = (
-                        probe(request.request_id) if probe is not None else None
-                    )
-                    if (
-                        loaded_from is not None
-                        and request.num_computed_tokens >= loaded_from
-                    ):
-                        if request.num_in_flight_tokens > 0:
-                            # Scheduled-but-unexecuted tokens exist (batch-queue
-                            # pipelining): schedule nothing for this request this
-                            # step so they drain, then advance on a later step.
-                            pr_drain = True
-                        else:
-                            logger.info(
-                                "PR JUMP req=%s computed %d -> %d (tail_front=%d)",
-                                request.request_id, request.num_computed_tokens,
-                                kv_tail_end, loaded_from)
-                            request.num_computed_tokens = kv_tail_end
-                            request.kv_tail_end = 0
-                            PR_JUMPS[request.request_id] = kv_tail_end
-
             num_new_tokens = (
                 request.num_tokens_with_spec
                 + request.num_output_placeholders
@@ -650,11 +601,6 @@ class Scheduler(SchedulerInterface):
                 - request.num_computed_tokens
                 - self.num_sampled_tokens_per_step,
             )
-
-            if pr_drain:
-                # Hold this request for one step (see the partial-recomp block above);
-                # the num_new_tokens == 0 path below handles it.
-                num_new_tokens = 0
 
             # Apply Mamba alignment before encoder caps.
             if self.need_mamba_block_aligned_split:
@@ -1118,16 +1064,6 @@ class Scheduler(SchedulerInterface):
                     num_encoder_tokens = sum(
                         request.get_num_encoder_embeds(i)
                         for i in encoder_inputs_to_schedule
-                    )
-
-                # Partial-recomputation-style tail restore: the background loader writes the cached
-                # tail straight into this request's paged blocks, so allocate the
-                # blocks for the whole tail region up front (as lookahead).
-                kv_tail_end = getattr(request, "kv_tail_end", 0)
-                if kv_tail_end:
-                    effective_lookahead_tokens = max(
-                        effective_lookahead_tokens,
-                        kv_tail_end - num_computed_tokens - num_new_tokens,
                     )
 
                 reserved_blocks = 0
